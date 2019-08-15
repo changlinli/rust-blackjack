@@ -1,2 +1,6 @@
 /target
 **/*.rs.bk
+
+# Idea files
+.idea
+*.iml
