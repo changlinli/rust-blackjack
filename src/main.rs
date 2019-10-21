@@ -12,23 +12,27 @@ enum Action {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-enum GameState {
-    GameWon,
-    GameLost,
-    Continuing(ContinuingGameState)
+enum GameState<'a> {
+    GameWon(PlayerState<'a>),
+    GameLost(PlayerState<'a>),
+    Continuing(PlayerState<'a>)
 }
 
-impl GameState {
-    fn start<R: Rng>(rng: &mut R) -> GameState {
-        let internal_state = ContinuingGameState {
-            deck: {
-                let mut unshuffled_deck = Deck::new();
-                unshuffled_deck.shuffle(rng);
-                unshuffled_deck
-            },
+impl<'a> GameState<'a> {
+    fn start<'b>(deck: &'b mut Deck) -> GameState<'b> {
+        let internal_state = PlayerState {
+            deck: deck,
             hand: Vec::new()
         };
         GameState::Continuing(internal_state)
+    }
+
+    fn player_state(&self) -> &PlayerState<'a> {
+        match self {
+            GameState::GameLost(p) => p,
+            GameState::GameWon(p) => p,
+            GameState::Continuing(p) => p,
+        }
     }
 }
 
@@ -69,10 +73,6 @@ impl HandValue {
 
     pub fn unsafe_from_u32(x: u32) -> HandValue {
         HandValue::from_u32(x).unwrap()
-    }
-
-    pub fn value(self) -> u32 {
-        self.value
     }
 
     pub fn combine_with_separate_value(&self, other_value: &HandValue) -> Option<HandValue> {
@@ -168,6 +168,27 @@ fn calculate_current_hand_value(hand: &Vec<CardValue>) -> Vec<HandValue> {
         )
 }
 
+fn cartesian_product<'a, 'b, A, B>(xs: &'a Vec<A>, ys: &'b Vec<B>) -> Vec<(&'a A, &'b B)> {
+    xs
+        .iter()
+        .flat_map::<Vec<(&A, &B)>, _>(|x| ys.iter().map(|y| (x, y)).collect())
+        .collect()
+}
+
+fn raw_calculate_current_hand_value(hand: &Vec<CardValue>) -> Vec<u32> {
+    hand
+        .iter()
+        .map(card_value_to_hand_value)
+        .fold(
+            vec![0],
+            |x, y|
+                cartesian_product(&x, &y)
+                    .iter()
+                    .map(|x_and_y| x_and_y.0 + x_and_y.1.value)
+                    .collect()
+        )
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct Card {
     suit: CardSuit,
@@ -175,9 +196,15 @@ struct Card {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct ContinuingGameState {
-    deck: Deck,
+struct PlayerState<'a> {
+    deck: &'a mut Deck,
     hand: Vec<Card>
+}
+
+impl<'a> PlayerState<'a> {
+    fn create_hand_values(&self) -> Vec<CardValue> {
+        self.hand.iter().map(|card| card.value.clone()).collect()
+    }
 }
 
 fn parse_action(str: &String) -> Option<Action> {
@@ -189,11 +216,6 @@ fn parse_action(str: &String) -> Option<Action> {
         "surrender" => Option::Some(Action::Surrender),
         _ => Option::None,
     }
-}
-
-enum CardStatus {
-    CardHasBeenDrawn,
-    CardNotYetDrawn
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -257,45 +279,53 @@ fn is_hand_too_large(hand: &Vec<Card>) -> bool {
     }
 }
 
-fn deal_with_action(action: &Action, state: GameState) -> GameState {
+fn deal_with_action<'a>(action: &Action, state: GameState<'a>) -> GameState<'a> {
     match state {
-        GameState::GameLost => GameState::GameLost,
-        GameState::GameWon => GameState::GameWon,
-        GameState::Continuing(mut continuingGameState) =>
+        x @ GameState::GameLost(_) => x,
+        x @ GameState::GameWon(_) => x,
+        GameState::Continuing(mut player_state) =>
             match action {
-                Action::Surrender => GameState::GameLost,
+                Action::Surrender => GameState::GameLost(player_state),
                 Action::Hit => {
-                    let card_opt = continuingGameState.deck.draw_card();
+                    let card_opt = player_state.deck.draw_card();
                     if let Option::Some(card) = card_opt {
-                        continuingGameState.hand.push(card);
+                        player_state.hand.push(card);
                     }
-                    if is_hand_too_large(&continuingGameState.hand) {
-                        GameState::GameLost
+                    if is_hand_too_large(&player_state.hand) {
+                        GameState::GameLost(player_state)
                     } else {
-                        GameState::Continuing(continuingGameState)
+                        let card_values = &player_state.create_hand_values();
+                        let possible_hand_values = calculate_current_hand_value(card_values);
+                        let are_any_hand_values_21 =
+                            possible_hand_values.iter().find(|x| x.value == 21).is_some();
+                        if are_any_hand_values_21 {
+                            GameState::GameWon(player_state)
+                        } else {
+                            GameState::Continuing(player_state)
+                        }
                     }
                 },
-                Action::Stand => GameState::GameLost,
-                Action::DoubleDown => GameState::GameLost,
-                Action::SplitCards => GameState::GameLost,
+                Action::Stand => GameState::GameLost(player_state),
+                Action::DoubleDown => GameState::GameLost(player_state),
+                Action::SplitCards => GameState::GameLost(player_state),
             }
     }
 }
 
-fn first_word(s: &str) -> &str {
-    let bytes = s.as_bytes();
-
-    for (i, &item) in bytes.iter().enumerate() {
-        if item == b' ' {
-            return &s[0..i];
-        }
+fn continue_with_game(game_state: &GameState) -> bool {
+    match game_state {
+        GameState::GameWon(_) => false,
+        GameState::GameLost(_) => false,
+        GameState::Continuing(_) => true,
     }
-
-    &s[..]
 }
 
-fn full_deck_of_cards() -> &'static[Card] {
-    unimplemented!()
+fn game_message(game_state: &GameState) -> &'static str {
+    match game_state {
+        GameState::GameWon(_) => "You won",
+        GameState::GameLost(_) => "You lost",
+        GameState::Continuing(_) => "The game is still going",
+    }
 }
 
 fn main() {
@@ -303,20 +333,22 @@ fn main() {
 
     println!("Please input what you'd like to do (hit/stand/double-down/split/surrender):");
 
-    let mut game_over = false;
-
     let mut raw_action = String::new();
 
-    let mut game_state = GameState::start(&mut thread_rng());
+    let mut deck = Deck::new();
+
+    deck.shuffle(&mut thread_rng());
+
+    let mut game_state = GameState::start(&mut deck);
 
     let stdin = io::stdin();
 
     let mut stdin_lines = stdin.lock().lines();
 
-    while game_state != GameState::GameLost {
-        if let GameState::Continuing(continuingGameState) = &game_state {
-            println!("Your hand is {:?}", &continuingGameState.hand);
-            println!("Your hand value is {:?}", calculate_current_hand_value(&continuingGameState.hand.iter().map(|x| x.value.clone()).collect()));
+    while continue_with_game(&game_state) {
+        if let GameState::Continuing(continuing_game_state) = &game_state {
+            println!("Your hand is {:?}", &continuing_game_state.hand);
+            println!("Your hand value is {:?}", calculate_current_hand_value(&continuing_game_state.hand.iter().map(|x| x.value.clone()).collect()));
 
         }
 
@@ -338,7 +370,11 @@ fn main() {
         }
 
 
-
     }
+
+    println!("{}", game_message(&game_state));
+
+    println!("Final hand: {:?}", game_state.player_state().hand);
+    println!("Final hand value: {:?}", raw_calculate_current_hand_value(&game_state.player_state().create_hand_values()));
 
 }
